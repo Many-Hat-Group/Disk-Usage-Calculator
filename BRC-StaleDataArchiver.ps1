@@ -217,6 +217,11 @@ function Get-NormalisedPath {
 }
 
 function Test-PathIsInside {
+    <#
+        Both paths must already have been through Get-NormalisedPath. This is
+        called in loops, and normalising here instead costs two GetFullPath
+        calls per comparison.
+    #>
     param(
         [string]$ChildPath,
         [string]$ParentPath
@@ -226,10 +231,34 @@ function Test-PathIsInside {
         return $false
     }
 
-    $Child = (Get-NormalisedPath -Path $ChildPath).TrimEnd('\') + '\'
-    $Parent = (Get-NormalisedPath -Path $ParentPath).TrimEnd('\') + '\'
+    $Child = $ChildPath.TrimEnd('\') + '\'
+    $Parent = $ParentPath.TrimEnd('\') + '\'
 
     return $Child.StartsWith($Parent, [System.StringComparison]::OrdinalIgnoreCase)
+}
+
+function Get-ParentPathString {
+    <#
+        The parent of an already normalised path, by string only. No filesystem
+        access and no GetFullPath, so it is cheap enough to call in a loop.
+        Returns "" once there is nothing left above.
+    #>
+    param([string]$Path)
+
+    if ([string]::IsNullOrWhiteSpace($Path)) {
+        return ""
+    }
+
+    $Trimmed = $Path.TrimEnd('\')
+    $Index = $Trimmed.LastIndexOf('\')
+
+    # Index 0 or 1 means we are at "\" or the "\\server" part of a UNC path,
+    # so there is no useful parent left.
+    if ($Index -lt 2) {
+        return ""
+    }
+
+    return $Trimmed.Substring(0, $Index)
 }
 
 # ---------------------------------------------------------------------------
@@ -268,7 +297,8 @@ function Read-SourcePathsFromCsv {
     #>
     param(
         [string]$CsvPath,
-        [bool]$OnlyStaleRows
+        [bool]$OnlyStaleRows,
+        [scriptblock]$OnProgress
     )
 
     $Result = [pscustomobject]@{
@@ -305,7 +335,19 @@ function Read-SourcePathsFromCsv {
     $Candidates = New-Object System.Collections.Generic.List[string]
     $Seen = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
 
+    $RowIndex = 0
+
     foreach ($Row in $Rows) {
+        if ($Script:CancelRequested) {
+            break
+        }
+
+        $RowIndex++
+
+        if ($OnProgress -and ($RowIndex % 50) -eq 0) {
+            & $OnProgress "Checking the folders listed in the CSV" $RowIndex $Rows.Count
+        }
+
         $RawPath = [string]$Row.$PathColumn
 
         if ([string]::IsNullOrWhiteSpace($RawPath)) {
@@ -343,24 +385,43 @@ function Read-SourcePathsFromCsv {
         $Candidates.Add($Normalised)
     }
 
-    # Shortest paths first, so a parent is always considered before its children.
+    # Shortest paths first, so a parent is always seen before its children.
     $Sorted = @($Candidates | Sort-Object -Property Length)
     $Kept = New-Object System.Collections.Generic.List[string]
+    $KeptKeys = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
+    $Checked = 0
 
     foreach ($Candidate in $Sorted) {
-        $IsNested = $false
+        if ($Script:CancelRequested) {
+            break
+        }
 
-        foreach ($Existing in $Kept) {
-            if (Test-PathIsInside -ChildPath $Candidate -ParentPath $Existing) {
+        # Walk this path's own parent chain and look each ancestor up directly.
+        # Comparing every candidate against every kept path instead makes this
+        # n-squared, which on a real CSV is minutes of frozen window.
+        $IsNested = $false
+        $Ancestor = Get-ParentPathString -Path $Candidate
+
+        while (-not [string]::IsNullOrEmpty($Ancestor)) {
+            if ($KeptKeys.Contains($Ancestor)) {
                 $IsNested = $true
                 break
             }
+
+            $Ancestor = Get-ParentPathString -Path $Ancestor
         }
 
         if ($IsNested) {
             $Result.SkippedNested++
         } else {
+            [void]$KeptKeys.Add($Candidate.TrimEnd('\'))
             $Kept.Add($Candidate)
+        }
+
+        $Checked++
+
+        if ($OnProgress -and ($Checked % 500) -eq 0) {
+            & $OnProgress "Removing folders that sit inside another folder" $Checked $Sorted.Count
         }
     }
 
@@ -472,7 +533,7 @@ function Get-FilesUnderPath {
             $Errors.Add("$RootPath : $($_.Exception.Message)")
         }
 
-        return $Files
+        return ,$Files
     }
 
     $Queue = New-Object System.Collections.Generic.Queue[string]
@@ -513,6 +574,14 @@ function Get-FilesUnderPath {
                     Length = [long]$File.Length
                     LastWriteTimeUtc = $File.LastWriteTimeUtc
                 })
+
+                if ($OnProgress -and ($Files.Count % 5000) -eq 0) {
+                    & $OnProgress $Files.Count
+
+                    if ($Script:CancelRequested) {
+                        break
+                    }
+                }
             }
         } catch {
             $Errors.Add("$Current : could not list files - $($_.Exception.Message)")
@@ -538,7 +607,7 @@ function Get-FilesUnderPath {
         }
     }
 
-    return $Files
+    return ,$Files
 }
 
 # ---------------------------------------------------------------------------
@@ -1093,7 +1162,10 @@ function Invoke-Analysis {
         $CsvResult = $null
 
         try {
-            $CsvResult = Read-SourcePathsFromCsv -CsvPath $CsvPath -OnlyStaleRows $CheckOnlyStale.Checked
+            $CsvResult = Read-SourcePathsFromCsv -CsvPath $CsvPath -OnlyStaleRows $CheckOnlyStale.Checked -OnProgress {
+                param($Phase, $Done, $Total)
+                Set-Status ("{0}: {1} of {2}" -f $Phase, $Done, $Total)
+            }
         } catch {
             Show-Warning -Message "The CSV could not be read:`r`n$($_.Exception.Message)" -Title "CSV error"
             return $null
@@ -1130,11 +1202,26 @@ function Invoke-Analysis {
             return $null
         }
 
+        if ($Script:CancelRequested) {
+            Write-Log "Cancelled while reading the CSV."
+            Set-Status "Cancelled."
+            return $null
+        }
+
         Write-Log ("Source folders to archive: {0}" -f $CsvResult.Paths.Count)
 
         # A destination inside a source, or a source inside the destination,
         # would make the copy feed itself.
+        Set-Status "Checking the destination does not overlap the source..."
+        $OverlapChecked = 0
+
         foreach ($SourceRoot in $CsvResult.Paths) {
+            $OverlapChecked++
+
+            if (($OverlapChecked % 500) -eq 0) {
+                [System.Windows.Forms.Application]::DoEvents()
+            }
+
             if (Test-PathIsInside -ChildPath $DestinationRoot -ParentPath $SourceRoot) {
                 Show-Warning -Message "The destination sits inside a source folder, which would copy files into themselves:`r`n`r`nSource: $SourceRoot`r`nDestination: $DestinationRoot" -Title "Invalid destination"
                 return $null
@@ -1176,6 +1263,9 @@ function Invoke-Analysis {
                 $Folders.Add((Join-Path -Path $DestinationForRoot -ChildPath $RelativeFolder))
             }
 
+            $RootBytes = [double]0
+            $Built = 0
+
             foreach ($File in $Files) {
                 $Items.Add([pscustomobject]@{
                     SourceRoot = $SourceRoot
@@ -1185,9 +1275,19 @@ function Invoke-Analysis {
                 })
 
                 $TotalBytes += $File.Length
+                $RootBytes += $File.Length
+                $Built++
+
+                if (($Built % 5000) -eq 0) {
+                    Set-Status ("Building the copy list: {0} of {1} files under {2}" -f $Built, $Files.Count, $SourceRoot)
+
+                    if ($Script:CancelRequested) {
+                        break
+                    }
+                }
             }
 
-            Write-Log ("{0} -> {1} ({2} files, {3})" -f $SourceRoot, $DestinationForRoot, $Files.Count, (Format-Bytes ([double]($Files | Measure-Object -Property Length -Sum).Sum)))
+            Write-Log ("{0} -> {1} ({2} files, {3})" -f $SourceRoot, $DestinationForRoot, $Files.Count, (Format-Bytes $RootBytes))
         }
 
         if ($Script:CancelRequested) {

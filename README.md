@@ -297,6 +297,12 @@ that looks complete.
 - Refuses to run if the destination is inside a source folder, or a source
   folder is inside the destination, because the copy would feed itself.
 
+The status bar reports progress through each stage of this and **Cancel** works
+throughout, including while the CSV is still being checked. The one part that
+cannot report progress is the initial read of the CSV file itself, which is a
+single operation; on a very large CSV expect a few seconds there before the
+counters start moving.
+
 ## Notes and limits
 
 - **Permissions do not come across.** A copied file inherits the destination's
@@ -317,5 +323,9 @@ that looks complete.
 - The whole file list is built in memory before the copy starts, because the
   free space check has to know the total size before anything is written. A
   source of several million files will use a noticeable amount of RAM.
+- Checking the folders listed in the CSV means one existence check per row. On
+  a UNC share each of those is a network round trip, so a CSV with tens of
+  thousands of rows takes a little while at that stage. It is reported in the
+  status bar and can be cancelled.
 - This tool copies. It does not delete the source. Deleting the originals is a
   separate decision to make after the verification report comes back clean.
