@@ -178,3 +178,144 @@ Import-Csv .\DiskUsage_20260801_101500.csv |
   checkpoint tracks byte offsets into that file; the tool detects a shortened
   file and refuses to resume, but an edit that keeps the length the same cannot
   be detected. Copy the CSV elsewhere if you want to work on it mid-scan.
+
+---
+
+# BRC Stale Data Archiver
+
+`BRC-StaleDataArchiver.ps1` is the second half of the stale data job. It takes
+the CSV that `BRC-StaleDirectoryFinder.ps1` produces, copies everything in those
+folders to somewhere else, and proves with checksums that every copied file is
+byte-for-byte identical to the original.
+
+Nothing at the source is changed or deleted. The tool only ever reads it.
+
+```powershell
+powershell.exe -ExecutionPolicy Bypass -File .\BRC-StaleDataArchiver.ps1
+```
+
+1. **Browse...** to the CSV that the stale directory finder wrote.
+2. **Browse...** to the destination folder or type a UNC path (`\\server\share\archive`).
+3. Press **Analyse only** to see the file count, the total size and the free
+   space position without writing anything.
+4. Press **Copy and verify** when you are happy with the numbers.
+
+## The free space check
+
+The copy will not start unless the destination passes all three of these:
+
+| Check | Behaviour |
+| --- | --- |
+| Free space is already below the minimum | Stops. Nothing is copied. |
+| The data does not fit at all | Stops. Nothing is copied. |
+| The copy would drop free space below the minimum | Stops. Nothing is copied. |
+
+The minimum defaults to **20 GB** and is set with **Stop if free space would
+drop below (GB)**. Free space is measured with `GetDiskFreeSpaceEx`, which works
+on local disks, mapped drives and UNC paths, and reports the space **available
+to you**, so a per-user quota on the share is respected rather than ignored.
+
+The check is repeated **while the copy runs**, every 100 files or every 1 GB
+written, whichever comes first. If something else fills the share mid-run, the
+job stops at the next file boundary instead of running the destination dry.
+
+If free space cannot be read at all, the tool says so and asks before
+continuing. It never treats an unreadable result as "enough room".
+
+## How the verification works
+
+For every file:
+
+1. The source is read once. The bytes are hashed on their way into the
+   destination file, so the source hash is of exactly what was written.
+2. The destination file is then read back off the disk and hashed
+   independently.
+3. The two hashes are compared. Anything other than an exact match is recorded
+   as `CHECKSUM MISMATCH` and counted as a failure.
+
+SHA256 is the default. SHA512, SHA1 and MD5 are also available. SHA1 and MD5
+will still catch a corrupted copy, but they are not collision resistant, so use
+SHA256 if the report has to stand up as evidence that the data was not altered.
+
+Original timestamps (created, modified, accessed) are carried across so the
+archive still shows how old the data is.
+
+## The verification report
+
+Every run writes `BRC-CopyVerify_yyyyMMdd_HHmmss.csv` into the destination
+folder. It is flushed after every file, so a cancelled or interrupted run still
+leaves a complete record of what it got through. This file is the evidence that
+the archive is a true copy — keep it.
+
+| Column | Meaning |
+| --- | --- |
+| SourceRoot | The folder from the CSV that this file came from |
+| SourceFile | Full path of the original file |
+| DestinationFile | Full path of the copy |
+| SizeBytes | File size |
+| Algorithm | Checksum algorithm used |
+| SourceChecksum | Hash of the bytes read from the source |
+| DestinationChecksum | Hash of the file re-read from the destination |
+| Verified | `True` only when the two hashes match |
+| Status | `Verified`, `Skipped - already verified`, `CHECKSUM MISMATCH`, `Failed` or `Cancelled` |
+| CompletedUtc | When the file finished |
+| Errors | The failure reason, when there is one |
+
+To confirm a finished run in one line:
+
+```powershell
+Import-Csv .\BRC-CopyVerify_20260819_101500.csv |
+    Where-Object { $_.Verified -ne 'True' }
+```
+
+Anything returned by that is a file you cannot treat as archived.
+
+## Options
+
+| Option | Meaning |
+| --- | --- |
+| Only use rows where IsStale = True | On by default. Turn it off if the finder was run with "export all folders" and you want the lot. |
+| Destination layout | **Mirror full source path** rebuilds `\\server\share\dept\old` as `<destination>\server\share\dept\old`, so two folders with the same name can never collide. **Folder name only** uses just the last folder name, adding `_2`, `_3` on a clash. |
+| Checksum | SHA256 (default), SHA512, SHA1 or MD5. |
+| Stop if free space would drop below (GB) | The safety floor. 20 GB by default. |
+| Skip files already at the destination | Re-runs are safe. A file already there with the same size is checksummed on both sides and skipped if it matches, so a stopped run can be restarted without copying everything again. |
+| Open the verification report when finished | Launches the report CSV. |
+
+**Cancel** stops after the current file. A file that was mid-copy is deleted
+rather than left as a partial, so the destination never holds a truncated file
+that looks complete.
+
+## What it does about the CSV
+
+- Reads the `Path` column (it also accepts `FullName`, `FolderPath`,
+  `DirectoryPath`, `SourcePath` or `FullPath`, so a per-file CSV works too).
+- Drops duplicates.
+- **Drops any folder that sits underneath another folder in the same list.** The
+  finder reports a stale parent *and* its stale children, and without this the
+  same files would be copied and hashed several times over.
+- Drops folders that no longer exist, and lists them in the log.
+- Refuses to run if the destination is inside a source folder, or a source
+  folder is inside the destination, because the copy would feed itself.
+
+## Notes and limits
+
+- **Permissions do not come across.** A copied file inherits the destination's
+  ACLs. Anyone who can read the destination can read the archived data, even if
+  the original folder was locked down. Check the destination permissions before
+  you run this, especially when the destination is a share other teams can
+  reach. The tool warns about this and asks twice when the destination is on the
+  network.
+- Files locked by another process are opened with read sharing, so they are
+  usually still copied. If a file is being written while it is copied, the
+  report shows what was captured at that moment.
+- Reparse points (junctions and symlinks) are listed in the log but not
+  followed, so target data is not copied twice.
+- Paths longer than 260 characters are handled through the `\\?\` form, so deep
+  legacy folder trees copy without the usual PowerShell 5.1 path length failure.
+- Empty folders are recreated at the destination, so the archive keeps the same
+  shape as the source.
+- The whole file list is built in memory before the copy starts, because the
+  free space check has to know the total size before anything is written. A
+  source of several million files will use a noticeable amount of RAM.
+- This tool copies. It does not delete the source. Deleting the originals is a
+  separate decision to make after the verification report comes back clean.
