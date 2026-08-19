@@ -1,3 +1,17 @@
+# BRC storage tools
+
+| Tool | What it does | Docs |
+| --- | --- | --- |
+| `BRCDiskUsageCalculator.ps1` | Measures a folder or share, one CSV row per directory and per file | this file |
+| `BRC-StaleDirectoryFinder.ps1` | Finds directories nothing has modified in *n* days/months/years | in-script header |
+| `BRC-FolderPermissionIndexer.ps1` | Indexes NTFS permissions across a tree | in-script header |
+| `BRC-FolderArchiver.ps1` | **Moves** stale folders to an archive, leaving a `.txt` signpost with a 24 character reference code, and reports it all as CSV | [BRC-FolderArchiver.md](BRC-FolderArchiver.md) |
+
+Everything here is read-only **except `BRC-FolderArchiver.ps1`**, which moves and
+deletes data. Read its documentation before running it.
+
+---
+
 # BRC Disk Usage Calculator
 
 A single-file Windows PowerShell GUI that measures a folder or UNC share and
