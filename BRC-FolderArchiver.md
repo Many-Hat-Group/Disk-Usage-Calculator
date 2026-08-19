@@ -167,7 +167,8 @@ folder that is not being archived are left where they are.
 | Group this run in a dated subfolder | Puts everything from one run under `<archive>\ArchiveRun_yyyyMMdd_HHmmss\`. |
 | Send originals to the Recycle Bin | A second safety net on a local volume. Has no effect on most UNC shares, which have no Recycle Bin — do not rely on it there. |
 | Clear read-only flags before removing | On by default. Without it a read-only file blocks the delete after the copy has already verified. |
-| Skip folders holding junctions/symlinks | On by default. Reparse points can point anywhere, including back into the tree, so those folders are reported and left alone. |
+| Skip folders holding junctions/symlinks | On by default. A junction, symlink or mount point can point anywhere, including outside the tree or back into it, so those folders are reported and left alone. See [Reparse points](#reparse-points-dedup-junctions-and-tiered-storage). |
+| Skip cloud-tiered, HSM and unrecognised stub files | On by default. Files whose data lives elsewhere and is recalled on read. Copying them pulls every file back, which can be slow and can cost money. |
 | Skip folders that contain no files | On by default. |
 | Remove the part-copy if a folder fails | On by default. The source is untouched either way; this just stops half-copies accumulating in the archive. |
 | List skipped folders in the CSV too | On by default, so the CSV is a full audit of the decision, not just the successes. |
@@ -181,6 +182,102 @@ folder that is not being archived are left where they are.
 | Also write `<Ref>_manifest.txt` in the archive | On by default. Puts a copy of the signpost next to the archived data, so the archive is self-describing even if the live share is later rebuilt. |
 | Print the archive path in the placeholder | Off by default. Off, the signpost says to quote the reference code instead. On, it names the archive path — convenient for I.T., but it also tells every user where the archive lives. |
 | Append to `_BRC_ArchiveIndex.csv` | On by default. A cumulative index of every archival across every run, kept in the archive root. |
+
+## Reparse points: dedup, junctions and tiered storage
+
+"Reparse point" is one NTFS mechanism covering two very different things, and
+the archiver treats them differently because only one of them is dangerous.
+
+| The item is | Examples | Archiver behaviour |
+| --- | --- | --- |
+| **A link** — stands in for something elsewhere | Junction, symbolic link, volume mount point, NFS special file | **Blocks the folder.** Copying it would pull in data from outside, and removing it could reach through to the target. |
+| **A stub** — the data really is here, stored differently | **Data Deduplication**, Windows Overlay compression, Single Instance Storage | **Ignored.** These are ordinary files. Reads return the real bytes at local speed. |
+| **A tiered stub** — the data is real but lives elsewhere | HSM, Azure File Sync cloud tiering, OneDrive placeholders | **Blocks the folder**, under its own switch, because copying recalls every file. |
+
+**This matters on any server running Data Deduplication.** Dedup stores every
+optimized file as a reparse point, and those files show up as
+`SparseFile, ReparsePoint`. A tool that treats "has a reparse point" as "do not
+touch" will refuse to archive essentially the whole volume. The archiver reads
+the actual reparse *tag* rather than just the attribute, so deduplicated files
+are archived normally.
+
+The tag is read with `FindFirstFileW`, which returns it without opening the
+file. If that is unavailable — Constrained Language Mode, `Add-Type` blocked by
+policy, a path that will not enumerate — every reparse point is treated as a
+link, which is the conservative answer. You will see this in the CSV as
+`Reparse point of an unreadable type`.
+
+Unknown tags are handled by rule rather than guesswork: a tag carrying the
+documented **name-surrogate bit** is a link, because that bit means the item
+stands in for another named object. Anything else unrecognised is grouped with
+the tiered stubs and blocked under that switch.
+
+Skip messages name the tag and an example path, so the CSV tells you what was
+found rather than just that something was:
+
+```
+Skipped because this folder contains a junction, symbolic link or mount point:
+'D:\BRCDATA1\PROJECTS\oldlink' is Junction or volume mount point (tag 0xA0000003)
+and 2 other such items. Nothing was copied or deleted, because it points
+somewhere else, so copying it would pull in data from outside this folder and
+removing it could reach through to the target.
+```
+
+### Finding reparse points yourself
+
+```powershell
+# What in this folder is not an ordinary file?
+Get-ChildItem 'D:\BRCDATA1' -Recurse -Force -ErrorAction SilentlyContinue |
+    Where-Object { $_.Attributes -band [System.IO.FileAttributes]::ReparsePoint } |
+    Select-Object FullName, Attributes, LinkType, Target
+
+# The exact tag for one item (needs an elevated session)
+fsutil reparsepoint query 'D:\BRCDATA1\some\item'
+```
+
+A `LinkType` of `Junction` or `SymbolicLink` with a `Target` is a real link.
+Ordinary documents showing `SparseFile, ReparsePoint` with no `LinkType` are
+dedup stubs.
+
+## ⚠️ Capacity planning on a deduplicated source
+
+**Copying a deduplicated file rehydrates it.** The archive receives full-size
+files, so the archive volume must hold the *logical* size of the data, not the
+smaller figure the source volume appears to use.
+
+Check the gap before choosing a destination:
+
+```powershell
+# Elevated session required
+Get-DedupVolume | Select-Object Volume, SavedSpace, SavingsRate
+```
+
+A volume showing a 42 % savings rate holds roughly 1.7 times more logical data
+than it occupies. Archiving from it to a plain volume needs that larger figure.
+
+The CSV's `TotalSizeBytes` and `SizeFriendly` columns already report logical
+sizes, so the preview CSV gives you the correct number for the target:
+
+```powershell
+$Rows = Import-Csv .\FolderArchive_20260819_140322.csv |
+    Where-Object { $_.Status -eq 'WouldArchive' }
+
+'{0:N2} GB will land in the archive' -f ((($Rows | Measure-Object -Property TotalSizeBytes -Sum).Sum) / 1GB)
+```
+
+Two ways to close the gap:
+
+- **Enable Data Deduplication on the archive volume.** Archived data dedupes
+  very well, and it is cold on arrival, so set
+  `Set-DedupVolume -Volume X: -MinimumFileAgeDays 1` rather than leaving the
+  three-day default.
+- **Use cloud tiering on the archive** (Azure File Sync). Cheaper for cold
+  data, but note that the archive then becomes a tiered volume itself, so a
+  future restore recalls from the cloud.
+
+Reading deduplicated files also costs I/O on the source while the dedup filter
+rehydrates them, so a large archive run is heavier on the source server than
+the file sizes suggest. Run it outside business hours.
 
 ## Safety model
 
@@ -335,6 +432,10 @@ figure if you need to do your own arithmetic.
   tree takes a while; the window may look busy while a single big folder copies.
 - Recursion depth follows the folder tree, so an extremely deep tree
   (thousands of levels) can exhaust the PowerShell call stack.
+- On a deduplicated volume the reparse tag is read once per file during
+  inventory. That is a fast call, but across hundreds of thousands of files it
+  is not free — expect inventory of a large folder to take noticeably longer
+  there than on a plain volume.
 - A run does not resume. Use the folder cap to work through a big share in
   sittings; folders already archived are simply no longer there to match.
 - Archived folder timestamps are preserved. The archive copy's own folder

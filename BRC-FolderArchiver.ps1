@@ -36,6 +36,11 @@ Notes:
 - Moving data does not carry the source share's inherited NTFS permissions with
   it unless you tick the robocopy permission option. Secure the archive share
   itself; see the README.
+- Data Deduplication stores optimized files as reparse points. This tool reads
+  the reparse tag rather than the attribute, so deduplicated and compressed
+  files are archived as ordinary files; only junctions, symlinks, mount points
+  and cloud/HSM tiered stubs stop a folder. Note that copying a deduplicated
+  file rehydrates it, so the archive needs room for the logical size.
 - This tool changes data. Test it against a copy of a folder tree first.
 #>
 
@@ -343,6 +348,316 @@ function Register-ExistingReferenceCodes {
 }
 
 # ---------------------------------------------------------------------------
+# Reparse points
+# ---------------------------------------------------------------------------
+#
+# "Reparse point" covers two very different things, and the difference decides
+# whether a folder is safe to archive:
+#
+#   A link  - a junction, symbolic link or volume mount point. It stands in for
+#             something somewhere else, possibly outside the tree, possibly on
+#             another server. Copying it duplicates data nobody asked to
+#             archive, and deleting it risks reaching through to the target.
+#             These block an archive.
+#
+#   A stub  - the file really is here, it is just stored differently. Data
+#             Deduplication, Windows Overlay compression and Single Instance
+#             Storage all work this way. Reads return the real bytes at local
+#             speed, so these are ordinary files as far as archiving goes.
+#             On a server with dedup enabled this is most of the volume.
+#
+# Tiered stubs (HSM, Azure File Sync, OneDrive placeholders) sit between the
+# two: the data is real but lives elsewhere, and reading it pulls it back,
+# which can be slow and can cost money. They get their own switch.
+#
+# The tag is read with FindFirstFileW, which returns it in dwReserved0 without
+# opening the file. If that is unavailable for any reason - Constrained
+# Language Mode, a blocked Add-Type, a path that will not enumerate - every
+# reparse point is treated as a link, which is the conservative answer and
+# matches how this tool behaved before tags were read at all.
+
+$script:ReparseSurrogateBit = [System.Convert]::ToUInt32('20000000', 16)
+
+# The data is here; only its on-disk representation differs.
+$script:ReparseTransparentTags = @{
+    '80000013' = 'Data Deduplication'
+    '80000017' = 'Windows Overlay compression'
+    '80000008' = 'Windows Image file'
+    '80000007' = 'Single Instance Storage'
+}
+
+# The data is real but elsewhere, and reading it recalls it.
+$script:ReparseTieredTags = @{
+    'C0000004' = 'Hierarchical Storage Management'
+    '80000006' = 'Hierarchical Storage Management 2'
+    '8000001E' = 'Azure File Sync cloud tiering'
+    '80000021' = 'OneDrive placeholder (legacy)'
+}
+
+# The item points at something else.
+$script:ReparseLinkTags = @{
+    'A0000003' = 'Junction or volume mount point'
+    'A000000C' = 'Symbolic link'
+    '80000014' = 'NFS special file'
+    '8000001B' = 'App execution alias'
+}
+
+$script:ReparseReaderAvailable = $false
+
+if (-not ('BRC.Native.ReparseReader' -as [type])) {
+    try {
+        Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+
+namespace BRC.Native
+{
+    public static class ReparseReader
+    {
+        private const int MAX_PATH = 260;
+        private const uint FILE_ATTRIBUTE_REPARSE_POINT = 0x400;
+
+        [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+        private struct WIN32_FIND_DATAW
+        {
+            public uint dwFileAttributes;
+            public System.Runtime.InteropServices.ComTypes.FILETIME ftCreationTime;
+            public System.Runtime.InteropServices.ComTypes.FILETIME ftLastAccessTime;
+            public System.Runtime.InteropServices.ComTypes.FILETIME ftLastWriteTime;
+            public uint nFileSizeHigh;
+            public uint nFileSizeLow;
+            public uint dwReserved0;
+            public uint dwReserved1;
+            [MarshalAs(UnmanagedType.ByValTStr, SizeConst = MAX_PATH)]
+            public string cFileName;
+            [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 14)]
+            public string cAlternateFileName;
+        }
+
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        private static extern IntPtr FindFirstFileW(string lpFileName, out WIN32_FIND_DATAW lpFindFileData);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool FindClose(IntPtr hFindFile);
+
+        // 0            = not a reparse point
+        // uint.MaxValue = the item could not be examined
+        // anything else = the reparse tag
+        public static uint GetReparseTag(string path)
+        {
+            WIN32_FIND_DATAW data;
+            IntPtr handle = FindFirstFileW(path, out data);
+
+            if (handle == new IntPtr(-1))
+            {
+                return uint.MaxValue;
+            }
+
+            try
+            {
+                if ((data.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) == 0)
+                {
+                    return 0;
+                }
+
+                return data.dwReserved0;
+            }
+            finally
+            {
+                FindClose(handle);
+            }
+        }
+    }
+}
+'@
+        $script:ReparseReaderAvailable = $true
+    } catch {
+        # Left unavailable on purpose. Get-PathReparseInfo falls back to
+        # treating every reparse point as a link.
+    }
+} else {
+    $script:ReparseReaderAvailable = $true
+}
+
+function ConvertTo-ExtendedLengthPath {
+    param(
+        [string]$Path
+    )
+
+    # FindFirstFileW stops at 260 characters unless the path is prefixed.
+    if ($Path.Length -lt 240) {
+        return $Path
+    }
+
+    if ($Path.StartsWith('\\?\')) {
+        return $Path
+    }
+
+    if ($Path.StartsWith('\\')) {
+        return '\\?\UNC\' + $Path.Substring(2)
+    }
+
+    if ($Path.Length -ge 2 -and $Path[1] -eq ':') {
+        return '\\?\' + $Path
+    }
+
+    return $Path
+}
+
+function Get-ReparseTagKind {
+    param(
+        [uint32]$Tag
+    )
+
+    if ($Tag -eq 0) {
+        return "None"
+    }
+
+    $Hex = '{0:X8}' -f $Tag
+
+    if ($script:ReparseTransparentTags.ContainsKey($Hex)) { return "Transparent" }
+    if ($script:ReparseTieredTags.ContainsKey($Hex))      { return "Tiered" }
+    if ($script:ReparseLinkTags.ContainsKey($Hex))        { return "Link" }
+
+    # Cloud files placeholders occupy the range 9000_01A, where the fifth
+    # nibble identifies the sync provider.
+    if ($Hex.Substring(0, 4) -eq '9000' -and $Hex.Substring(5) -eq '01A') {
+        return "Tiered"
+    }
+
+    # Documented rule: the name surrogate bit means the reparse point stands in
+    # for another named object, which is exactly what a link is.
+    if (([uint64]$Tag -band [uint64]$script:ReparseSurrogateBit) -ne 0) {
+        return "Link"
+    }
+
+    return "Unknown"
+}
+
+function Get-ReparseTagName {
+    param(
+        [uint32]$Tag
+    )
+
+    if ($Tag -eq 0) {
+        return ""
+    }
+
+    $Hex = '{0:X8}' -f $Tag
+
+    foreach ($Table in @($script:ReparseTransparentTags, $script:ReparseTieredTags, $script:ReparseLinkTags)) {
+        if ($Table.ContainsKey($Hex)) {
+            return ("{0} (tag 0x{1})" -f $Table[$Hex], $Hex)
+        }
+    }
+
+    if ($Hex.Substring(0, 4) -eq '9000' -and $Hex.Substring(5) -eq '01A') {
+        return ("Cloud files placeholder (tag 0x{0})" -f $Hex)
+    }
+
+    return ("Unrecognised reparse point (tag 0x{0})" -f $Hex)
+}
+
+function Get-PathReparseInfo {
+    <#
+        Classifies one item. Anything that cannot be read confidently comes
+        back as a link, because a link is the answer that stops the archive.
+    #>
+    param(
+        [string]$Path,
+        [System.IO.FileAttributes]$Attributes
+    )
+
+    if (($Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne [System.IO.FileAttributes]::ReparsePoint) {
+        return [pscustomobject]@{
+            Kind    = "None"
+            Tag     = [uint32]0
+            TagName = ""
+            Path    = $Path
+        }
+    }
+
+    if ($script:ReparseReaderAvailable) {
+        try {
+            $Tag = [BRC.Native.ReparseReader]::GetReparseTag((ConvertTo-ExtendedLengthPath -Path $Path))
+
+            if ($Tag -ne [uint32]::MaxValue -and $Tag -ne 0) {
+                return [pscustomobject]@{
+                    Kind    = (Get-ReparseTagKind -Tag $Tag)
+                    Tag     = $Tag
+                    TagName = (Get-ReparseTagName -Tag $Tag)
+                    Path    = $Path
+                }
+            }
+        } catch {
+            # Fall through to the conservative answer below.
+        }
+    }
+
+    return [pscustomobject]@{
+        Kind    = "Link"
+        Tag     = [uint32]0
+        TagName = "Reparse point of an unreadable type"
+        Path    = $Path
+    }
+}
+
+function New-ReparseFindingSet {
+    return [pscustomobject]@{
+        Links       = (New-Object 'System.Collections.Generic.List[object]')
+        Tiered      = (New-Object 'System.Collections.Generic.List[object]')
+        StubCount   = 0
+        StubExample = ""
+    }
+}
+
+function Add-ReparseFinding {
+    <#
+        Records anything that is not an ordinary file. Blocking findings are
+        named individually and capped, so a pathological tree cannot exhaust
+        memory. Transparent stubs are only counted: on a deduplicated volume
+        every file is one, and there is nothing to decide about them.
+    #>
+    param(
+        [pscustomobject]$FindingSet,
+        [string]$Path,
+        [System.IO.FileAttributes]$Attributes
+    )
+
+    if (($Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne [System.IO.FileAttributes]::ReparsePoint) {
+        return
+    }
+
+    $Info = Get-PathReparseInfo -Path $Path -Attributes $Attributes
+
+    switch ($Info.Kind) {
+        "Transparent" {
+            $FindingSet.StubCount++
+
+            if ([string]::IsNullOrEmpty($FindingSet.StubExample)) {
+                $FindingSet.StubExample = $Info.TagName
+            }
+        }
+        "Link" {
+            if ($FindingSet.Links.Count -lt 100) {
+                $FindingSet.Links.Add($Info)
+            }
+        }
+        "Tiered" {
+            if ($FindingSet.Tiered.Count -lt 100) {
+                $FindingSet.Tiered.Add($Info)
+            }
+        }
+        "Unknown" {
+            if ($FindingSet.Tiered.Count -lt 100) {
+                $FindingSet.Tiered.Add($Info)
+            }
+        }
+    }
+}
+
+# ---------------------------------------------------------------------------
 # Inventory
 # ---------------------------------------------------------------------------
 
@@ -360,7 +675,7 @@ function Get-FolderInventory {
         [System.Collections.Generic.List[string]]$Lines,
         [System.Collections.Generic.Dictionary[string, long]]$FileMap,
         [System.Collections.Generic.List[string]]$Errors,
-        [ref]$SeenReparsePoint
+        [pscustomobject]$ReparseSet
     )
 
     $Indent = "  " * $Depth
@@ -375,9 +690,7 @@ function Get-FolderInventory {
         $DirInfo = New-Object System.IO.DirectoryInfo($CurrentPath)
         $NewestWrite = $DirInfo.LastWriteTime
 
-        if (($DirInfo.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -eq [System.IO.FileAttributes]::ReparsePoint) {
-            $SeenReparsePoint.Value = $true
-        }
+        Add-ReparseFinding -FindingSet $ReparseSet -Path $CurrentPath -Attributes $DirInfo.Attributes
     } catch {
         $Errors.Add("Could not read directory info for '$CurrentPath': $($_.Exception.Message)")
     }
@@ -425,9 +738,7 @@ function Get-FolderInventory {
             (Format-SizeFriendly -Bytes ([long]$FileInfo.Length)), `
             $FileInfo.LastWriteTime.ToString("yyyy-MM-dd HH:mm:ss")))
 
-        if (($FileInfo.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -eq [System.IO.FileAttributes]::ReparsePoint) {
-            $SeenReparsePoint.Value = $true
-        }
+        Add-ReparseFinding -FindingSet $ReparseSet -Path $FileInfo.FullName -Attributes $FileInfo.Attributes
     }
 
     foreach ($ChildPath in ($ChildFolders | Sort-Object)) {
@@ -440,7 +751,7 @@ function Get-FolderInventory {
             -Lines $Lines `
             -FileMap $FileMap `
             -Errors $Errors `
-            -SeenReparsePoint $SeenReparsePoint
+            -ReparseSet $ReparseSet
 
         $FolderCount += $ChildResult.FolderCount
         $FileCount += $ChildResult.FileCount
@@ -476,8 +787,7 @@ function Get-CandidateInventory {
     $Lines = New-Object 'System.Collections.Generic.List[string]'
     $FileMap = New-Object 'System.Collections.Generic.Dictionary[string, long]'
     $Errors = New-Object 'System.Collections.Generic.List[string]'
-    $SeenReparsePoint = $false
-    $ReparseRef = [ref]$SeenReparsePoint
+    $ReparseSet = New-ReparseFindingSet
 
     $Result = Get-FolderInventory `
         -CurrentPath $FolderPath `
@@ -486,7 +796,7 @@ function Get-CandidateInventory {
         -Lines $Lines `
         -FileMap $FileMap `
         -Errors $Errors `
-        -SeenReparsePoint $ReparseRef
+        -ReparseSet $ReparseSet
 
     $FolderLastWrite = $null
 
@@ -505,7 +815,10 @@ function Get-CandidateInventory {
         Lines              = $Lines
         FileMap            = $FileMap
         Errors             = $Errors
-        HasReparsePoint    = $ReparseRef.Value
+        LinkFindings       = $ReparseSet.Links
+        TieredFindings     = $ReparseSet.Tiered
+        StubCount          = $ReparseSet.StubCount
+        StubExample        = $ReparseSet.StubExample
     }
 }
 
@@ -932,20 +1245,22 @@ function Build-NewestWriteMap {
 
     $HadError = $false
     $NewestWrite = $null
-    $IsReparsePoint = $false
+    $IsLink = $false
 
     try {
         $DirInfo = New-Object System.IO.DirectoryInfo($CurrentPath)
         $NewestWrite = $DirInfo.LastWriteTime
 
-        if (($DirInfo.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -eq [System.IO.FileAttributes]::ReparsePoint) {
-            $IsReparsePoint = $true
+        # Only a link is a reason not to walk in. A folder that is merely
+        # deduplicated or compressed is an ordinary folder.
+        if ((Get-PathReparseInfo -Path $CurrentPath -Attributes $DirInfo.Attributes).Kind -eq "Link") {
+            $IsLink = $true
         }
     } catch {
         $HadError = $true
     }
 
-    if (-not $IsReparsePoint) {
+    if (-not $IsLink) {
         try {
             foreach ($FilePath in [System.IO.Directory]::EnumerateFiles($CurrentPath)) {
                 try {
@@ -990,9 +1305,9 @@ function Build-NewestWriteMap {
     }
 
     $Entry = [pscustomobject]@{
-        NewestWrite    = $NewestWrite
-        HadError       = $HadError
-        IsReparsePoint = $IsReparsePoint
+        NewestWrite = $NewestWrite
+        HadError    = $HadError
+        IsLink      = $IsLink
     }
 
     $Map[(Get-NormalisedPath -Path $CurrentPath).ToLowerInvariant()] = $Entry
@@ -1016,23 +1331,23 @@ function Get-FolderAgeEntry {
 
     $HadError = $false
     $NewestWrite = $null
-    $IsReparsePoint = $false
+    $IsLink = $false
 
     try {
         $DirInfo = New-Object System.IO.DirectoryInfo($FolderPath)
         $NewestWrite = $DirInfo.LastWriteTime
 
-        if (($DirInfo.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -eq [System.IO.FileAttributes]::ReparsePoint) {
-            $IsReparsePoint = $true
+        if ((Get-PathReparseInfo -Path $FolderPath -Attributes $DirInfo.Attributes).Kind -eq "Link") {
+            $IsLink = $true
         }
     } catch {
         $HadError = $true
     }
 
     return [pscustomobject]@{
-        NewestWrite    = $NewestWrite
-        HadError       = $HadError
-        IsReparsePoint = $IsReparsePoint
+        NewestWrite = $NewestWrite
+        HadError    = $HadError
+        IsLink      = $IsLink
     }
 }
 
@@ -1138,6 +1453,24 @@ function ConvertTo-ResultRow {
     )
 }
 
+function Format-ReparseSkipReason {
+    param(
+        [System.Collections.Generic.List[object]]$Findings,
+        [string]$What,
+        [string]$Why
+    )
+
+    $Example = $Findings[0]
+    $Extra = ""
+
+    if ($Findings.Count -gt 1) {
+        $Extra = " and {0} other such {1}" -f ($Findings.Count - 1), $(if ($Findings.Count -eq 2) { "item" } else { "items" })
+    }
+
+    return ("Skipped because this folder contains {0}: '{1}' is {2}{3}. Nothing was copied or deleted, because {4}." -f `
+        $What, $Example.Path, $Example.TagName, $Extra, $Why)
+}
+
 function Invoke-ArchiveCandidate {
     param(
         [pscustomobject]$Config,
@@ -1194,9 +1527,15 @@ function Invoke-ArchiveCandidate {
         return $Result
     }
 
-    if ($Inventory.HasReparsePoint -and $Config.SkipReparsePoints) {
+    if ($Config.SkipLinkedFolders -and $Inventory.LinkFindings.Count -gt 0) {
         $Result.Status = "Skipped"
-        $Errors.Add("Skipped because the folder contains a junction, symlink or other reparse point.")
+        $Errors.Add((Format-ReparseSkipReason -Findings $Inventory.LinkFindings -What "a junction, symbolic link or mount point" -Why "it points somewhere else, so copying it would pull in data from outside this folder and removing it could reach through to the target"))
+        return $Result
+    }
+
+    if ($Config.SkipTieredFiles -and $Inventory.TieredFindings.Count -gt 0) {
+        $Result.Status = "Skipped"
+        $Errors.Add((Format-ReparseSkipReason -Findings $Inventory.TieredFindings -What "cloud-tiered, HSM or unrecognised stub files" -Why "the data lives elsewhere and copying it would recall every file, which can be slow and can cost money"))
         return $Result
     }
 
@@ -1441,7 +1780,7 @@ function Invoke-ArchiveWalk {
 
         $AgeEntry = Get-FolderAgeEntry -Config $Config -FolderPath $ChildPath
 
-        if ($AgeEntry.IsReparsePoint -and $Config.SkipReparsePoints) {
+        if ($AgeEntry.IsLink -and $Config.SkipLinkedFolders) {
             $Counters.Skipped++
             continue
         }
@@ -1811,6 +2150,7 @@ This is a LIVE archive run. It will move data and then delete the originals.
   Copy engine        : $($Options.CopyMethod)
   Verification       : $(if ($Options.VerifyWithHash) { "names, sizes and SHA-256 of every file" } else { "names and sizes of every file" })
   Delete method      : $(if ($Options.UseRecycleBin) { "send the original to the Recycle Bin" } else { "permanent delete of the original" })
+  Reparse points     : $(if ($Options.SkipLinkedFolders) { "links skipped" } else { "LINKS NOT SKIPPED" }); $(if ($Options.SkipTieredFiles) { "tiered/HSM stubs skipped" } else { "TIERED/HSM STUBS NOT SKIPPED" }); dedup and compression treated as ordinary files
   Folder cap         : $(if ($Options.MaxFolders -gt 0) { "$($Options.MaxFolders) folders this run" } else { "no cap" })
 
 For every matching folder the tool will:
@@ -1865,7 +2205,8 @@ and do that first.
         VerifyWithHash              = $Options.VerifyWithHash
         UseRecycleBin               = $Options.UseRecycleBin
         ClearReadOnly               = $Options.ClearReadOnly
-        SkipReparsePoints           = $Options.SkipReparsePoints
+        SkipLinkedFolders           = $Options.SkipLinkedFolders
+        SkipTieredFiles             = $Options.SkipTieredFiles
         SkipEmptyFolders            = $Options.SkipEmptyFolders
         PreserveStructure           = $Options.PreserveStructure
         GroupRunInDatedFolder       = $Options.GroupRunInDatedFolder
@@ -2019,7 +2360,7 @@ and do that first.
 
 $Form = New-Object System.Windows.Forms.Form
 $Form.Text = "BRC Folder Archiver"
-$Form.Size = New-Object System.Drawing.Size(872, 838)
+$Form.Size = New-Object System.Drawing.Size(872, 866)
 $Form.StartPosition = "CenterScreen"
 $Form.MaximizeBox = $false
 $Form.FormBorderStyle = "FixedDialog"
@@ -2201,7 +2542,7 @@ $GroupWhat.Controls.Add($NumericMaxFolders)
 $GroupHow = New-Object System.Windows.Forms.GroupBox
 $GroupHow.Text = "How to archive"
 $GroupHow.Location = New-Object System.Drawing.Point(15, 365)
-$GroupHow.Size = New-Object System.Drawing.Size(825, 150)
+$GroupHow.Size = New-Object System.Drawing.Size(825, 178)
 $Form.Controls.Add($GroupHow)
 
 $LabelCopyMethod = New-Object System.Windows.Forms.Label
@@ -2261,12 +2602,12 @@ $CheckClearReadOnly.Size = New-Object System.Drawing.Size(300, 24)
 $CheckClearReadOnly.Checked = $true
 $GroupHow.Controls.Add($CheckClearReadOnly)
 
-$CheckSkipReparse = New-Object System.Windows.Forms.CheckBox
-$CheckSkipReparse.Text = "Skip folders holding junctions/symlinks"
-$CheckSkipReparse.Location = New-Object System.Drawing.Point(320, 82)
-$CheckSkipReparse.Size = New-Object System.Drawing.Size(250, 24)
-$CheckSkipReparse.Checked = $true
-$GroupHow.Controls.Add($CheckSkipReparse)
+$CheckSkipLinks = New-Object System.Windows.Forms.CheckBox
+$CheckSkipLinks.Text = "Skip folders holding junctions/symlinks"
+$CheckSkipLinks.Location = New-Object System.Drawing.Point(320, 82)
+$CheckSkipLinks.Size = New-Object System.Drawing.Size(250, 24)
+$CheckSkipLinks.Checked = $true
+$GroupHow.Controls.Add($CheckSkipLinks)
 
 $CheckSkipEmpty = New-Object System.Windows.Forms.CheckBox
 $CheckSkipEmpty.Text = "Skip folders that contain no files"
@@ -2296,11 +2637,24 @@ $CheckOpenCsv.Size = New-Object System.Drawing.Size(235, 24)
 $CheckOpenCsv.Checked = $true
 $GroupHow.Controls.Add($CheckOpenCsv)
 
+$CheckSkipTiered = New-Object System.Windows.Forms.CheckBox
+$CheckSkipTiered.Text = "Skip cloud-tiered, HSM and unrecognised stub files"
+$CheckSkipTiered.Location = New-Object System.Drawing.Point(15, 138)
+$CheckSkipTiered.Size = New-Object System.Drawing.Size(340, 24)
+$CheckSkipTiered.Checked = $true
+$GroupHow.Controls.Add($CheckSkipTiered)
+
+$LabelStubHelp = New-Object System.Windows.Forms.Label
+$LabelStubHelp.Text = "Deduplicated and compressed files are ordinary files here and never block a run. Only links, and stubs whose data lives elsewhere, do."
+$LabelStubHelp.Location = New-Object System.Drawing.Point(365, 141)
+$LabelStubHelp.Size = New-Object System.Drawing.Size(450, 32)
+$GroupHow.Controls.Add($LabelStubHelp)
+
 # --- Placeholder file ------------------------------------------------------
 
 $GroupPlaceholder = New-Object System.Windows.Forms.GroupBox
 $GroupPlaceholder.Text = "The .txt file left behind, and its match in the archive"
-$GroupPlaceholder.Location = New-Object System.Drawing.Point(15, 520)
+$GroupPlaceholder.Location = New-Object System.Drawing.Point(15, 548)
 $GroupPlaceholder.Size = New-Object System.Drawing.Size(825, 135)
 $Form.Controls.Add($GroupPlaceholder)
 
@@ -2361,40 +2715,40 @@ $GroupPlaceholder.Controls.Add($CheckAppendIndex)
 
 $CheckPreview = New-Object System.Windows.Forms.CheckBox
 $CheckPreview.Text = "Preview only - list what would be archived and change nothing"
-$CheckPreview.Location = New-Object System.Drawing.Point(20, 665)
+$CheckPreview.Location = New-Object System.Drawing.Point(20, 693)
 $CheckPreview.Size = New-Object System.Drawing.Size(500, 24)
 $CheckPreview.Checked = $true
 $CheckPreview.Font = New-Object System.Drawing.Font($Form.Font, [System.Drawing.FontStyle]::Bold)
 $Form.Controls.Add($CheckPreview)
 
 $ProgressBar = New-Object System.Windows.Forms.ProgressBar
-$ProgressBar.Location = New-Object System.Drawing.Point(20, 694)
+$ProgressBar.Location = New-Object System.Drawing.Point(20, 722)
 $ProgressBar.Size = New-Object System.Drawing.Size(820, 20)
 $ProgressBar.Style = "Blocks"
 $Form.Controls.Add($ProgressBar)
 
 $StatusLabel = New-Object System.Windows.Forms.Label
 $StatusLabel.Text = "Ready. Run a preview first and read the CSV before you archive for real."
-$StatusLabel.Location = New-Object System.Drawing.Point(20, 720)
+$StatusLabel.Location = New-Object System.Drawing.Point(20, 748)
 $StatusLabel.Size = New-Object System.Drawing.Size(820, 20)
 $Form.Controls.Add($StatusLabel)
 
 $ButtonStart = New-Object System.Windows.Forms.Button
 $ButtonStart.Text = "Run Preview"
-$ButtonStart.Location = New-Object System.Drawing.Point(535, 748)
+$ButtonStart.Location = New-Object System.Drawing.Point(535, 776)
 $ButtonStart.Size = New-Object System.Drawing.Size(100, 30)
 $Form.Controls.Add($ButtonStart)
 
 $ButtonCancel = New-Object System.Windows.Forms.Button
 $ButtonCancel.Text = "Cancel"
-$ButtonCancel.Location = New-Object System.Drawing.Point(640, 748)
+$ButtonCancel.Location = New-Object System.Drawing.Point(640, 776)
 $ButtonCancel.Size = New-Object System.Drawing.Size(95, 30)
 $ButtonCancel.Enabled = $false
 $Form.Controls.Add($ButtonCancel)
 
 $ButtonClose = New-Object System.Windows.Forms.Button
 $ButtonClose.Text = "Close"
-$ButtonClose.Location = New-Object System.Drawing.Point(745, 748)
+$ButtonClose.Location = New-Object System.Drawing.Point(745, 776)
 $ButtonClose.Size = New-Object System.Drawing.Size(95, 30)
 $Form.Controls.Add($ButtonClose)
 
@@ -2494,7 +2848,8 @@ $ButtonStart.Add_Click({
         GroupRunInDatedFolder        = $CheckDatedFolder.Checked
         UseRecycleBin                = $CheckRecycleBin.Checked
         ClearReadOnly                = $CheckClearReadOnly.Checked
-        SkipReparsePoints            = $CheckSkipReparse.Checked
+        SkipLinkedFolders            = $CheckSkipLinks.Checked
+        SkipTieredFiles              = $CheckSkipTiered.Checked
         SkipEmptyFolders             = $CheckSkipEmpty.Checked
         CleanUpFailedCopies          = $CheckCleanUpFailed.Checked
         LogSkipped                   = $CheckLogSkipped.Checked
