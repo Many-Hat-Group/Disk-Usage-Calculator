@@ -6,9 +6,12 @@
 | `BRC-StaleDirectoryFinder.ps1` | Finds directories nothing has modified in *n* days/months/years | in-script header |
 | `BRC-FolderPermissionIndexer.ps1` | Indexes NTFS permissions across a tree | in-script header |
 | `BRC-FolderArchiver.ps1` | **Moves** stale folders to an archive, leaving a `.txt` signpost with a 24 character reference code, and reports it all as CSV | [BRC-FolderArchiver.md](BRC-FolderArchiver.md) |
+| `BRC-B2UploadScriptGenerator.bat` | Turns a `BRC-StaleDirectoryFinder.ps1` CSV into a ready-to-run WinSCP job that uploads the stale folders to a Backblaze B2 bucket | [BRC-B2UploadScriptGenerator.md](BRC-B2UploadScriptGenerator.md) |
 
-Everything here is read-only **except `BRC-FolderArchiver.ps1`**, which moves and
-deletes data. Read its documentation before running it.
+Everything here is read-only against the source **except `BRC-FolderArchiver.ps1`**,
+which moves and deletes local data. Read its documentation before running it.
+`BRC-B2UploadScriptGenerator.bat` is also read-only against the source - it only
+writes to a Backblaze B2 bucket over the internet, never back to the source.
 
 ---
 

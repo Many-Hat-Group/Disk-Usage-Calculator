@@ -1,0 +1,10 @@
+# Local B2 credentials - never commit your filled-in copy.
+# (b2-credentials.bat.example is the template and IS tracked.)
+b2-credentials.bat
+
+# Output of BRC-B2UploadScriptGenerator.bat - generated per run, contains
+# real local paths and run-specific WinSCP scripts/logs.
+*_B2Upload.bat
+*_B2Upload_winscp.txt
+*_B2Upload_folders.txt
+*_B2Upload.log
