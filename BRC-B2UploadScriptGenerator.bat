@@ -43,6 +43,16 @@ setlocal EnableDelayedExpansion
 ::   site is the recommended, no-secrets-on-disk-here option).
 :: - b2-credentials.bat is listed in .gitignore. Never commit your filled-in
 ::   copy.
+:: - The WinSCP script (.txt) file never contains an "open" line - WinSCP does
+::   NOT substitute %VAR% environment references inside a script file, so
+::   that would send WinSCP a literal, unresolved "%VAR%" as a hostname.
+::   Instead, the runner .bat passes the resolved site name / session URL as a
+::   plain argument on the winscp.com command line, which cmd.exe (not
+::   WinSCP) expands. That argument briefly appears in the winscp.com
+::   process's own command line while it runs - visible to Task Manager /
+::   Process Explorer / command-line auditing on this machine, but never
+::   written to any file. This only matters for Option B (inline key); a
+::   WinSCP saved site name is not a secret at all.
 ::
 :: Known limitations:
 :: - This is plain batch CSV parsing (no quoted-field support). If a folder
@@ -50,10 +60,6 @@ setlocal EnableDelayedExpansion
 ::   paths essentially never contain commas, but if BRC-StaleDirectoryFinder
 ::   reports something odd, check <name>_B2Upload_folders.txt before running
 ::   the upload.
-:: - A folder path containing a literal percent sign could, in rare cases,
-::   be misread by WinSCP's own script engine (which also uses %VAR%
-::   substitution). Check <name>_B2Upload_winscp.txt if a path like that
-::   is involved.
 :: - If the CSV lists both a stale parent folder and a stale child folder
 ::   inside it, both are uploaded independently, so the child's files are
 ::   transferred twice. This wastes time and bandwidth but is not harmful
@@ -164,14 +170,22 @@ if "%COUNT%"=="0" (
     exit /b 1
 )
 
-:: --- Work out how the WinSCP "open" line should read, without ever writing
-::     an actual secret value into the generated file - only %%PLACEHOLDER%%
-::     tokens, which WinSCP substitutes from the environment at run time. ---
-set "OPEN_LINE="
+:: --- Work out how the runner .bat should tell WinSCP which session to open.
+::     IMPORTANT: WinSCP does NOT substitute %VAR% environment references
+::     inside a script (.txt) file - a line like "open %WINSCP_SITE%" in the
+::     script is sent to WinSCP literally and it will try to connect to a
+::     host actually named "%WINSCP_SITE%". Instead, the session is passed as
+::     a plain argument on the winscp.com command line in the runner .bat, so
+::     it is cmd.exe (not WinSCP) that expands %%PLACEHOLDER%% - and cmd.exe
+::     genuinely does expand it, at the moment the runner .bat runs. That
+::     keeps the actual secret value out of every generated file; it only
+::     ever exists as a resolved environment variable, briefly, in the
+::     winscp.com process's own command line. ---
+set "SESSION_ARG="
 if defined WINSCP_SITE (
-    set "OPEN_LINE=%%WINSCP_SITE%%"
+    set "SESSION_ARG=%%WINSCP_SITE%%"
 ) else (
-    set "OPEN_LINE=s3://%%B2_KEY_ID%%:%%B2_APP_KEY%%@%%B2_ENDPOINT%%/"
+    set "SESSION_ARG=s3://%%B2_KEY_ID%%:%%B2_APP_KEY%%@%%B2_ENDPOINT%%/"
 )
 
 set "SYNC_FLAGS=remote"
@@ -187,7 +201,6 @@ echo Writing %OUT_WINSCP% ...
     echo option batch on
     echo option confirm off
     echo option transfer binary
-    echo open !OPEN_LINE!
     for /f "usebackq tokens=1,2 delims=|" %%L in ("%OUT_LIST%") do (
         echo synchronize %SYNC_FLAGS% "%%~L" "%%~M"
     )
@@ -233,7 +246,7 @@ echo Writing %OUT_BAT% ...
     echo echo Uploading %COUNT% stale folder^(s^) to Backblaze B2, bucket "%%B2_BUCKET%%"...
     echo echo Log: %OUT_LOG%
     echo.
-    echo "%%WINSCP%%" /ini=nul /log="%OUT_LOG%" /script="%OUT_WINSCP%"
+    echo "%%WINSCP%%" "!SESSION_ARG!" /ini=nul /log="%OUT_LOG%" /script="%OUT_WINSCP%"
     echo set "RC=%%ERRORLEVEL%%"
     echo.
     echo if "%%RC%%"=="0" ^(
