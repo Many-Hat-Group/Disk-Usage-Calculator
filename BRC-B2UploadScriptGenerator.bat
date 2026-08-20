@@ -43,16 +43,19 @@ setlocal EnableDelayedExpansion
 ::   site is the recommended, no-secrets-on-disk-here option).
 :: - b2-credentials.bat is listed in .gitignore. Never commit your filled-in
 ::   copy.
-:: - The WinSCP script (.txt) file never contains an "open" line - WinSCP does
-::   NOT substitute %VAR% environment references inside a script file, so
-::   that would send WinSCP a literal, unresolved "%VAR%" as a hostname.
-::   Instead, the runner .bat passes the resolved site name / session URL as a
-::   plain argument on the winscp.com command line, which cmd.exe (not
-::   WinSCP) expands. That argument briefly appears in the winscp.com
-::   process's own command line while it runs - visible to Task Manager /
-::   Process Explorer / command-line auditing on this machine, but never
-::   written to any file. This only matters for Option B (inline key); a
-::   WinSCP saved site name is not a secret at all.
+:: - The generated *_B2Upload_winscp.txt never contains an "open" line, and the
+::   runner .bat never passes /ini=nul to winscp.com. Both matter: WinSCP does
+::   NOT substitute %VAR% environment references written inside a script
+::   file, and /ini=nul tells WinSCP to ignore its whole configuration store -
+::   exactly where a saved site (Option A) is defined. Instead, at run time
+::   the runner .bat writes a small temporary script - an explicit
+::   "open <value>" line, with <value> resolved by cmd.exe (not WinSCP) from
+::   the environment, followed by the rest of *_B2Upload_winscp.txt - runs
+::   WinSCP against that temporary script (so WinSCP's normal configuration
+::   store is available to resolve a saved site), then deletes the temporary
+::   file. With Option B (inline key), the resolved key briefly
+::   exists in that one temporary file while the run is in progress; a WinSCP
+::   saved site name (Option A) is not a secret at all.
 ::
 :: Known limitations:
 :: - This is plain batch CSV parsing (no quoted-field support). If a folder
@@ -174,13 +177,19 @@ if "%COUNT%"=="0" (
 ::     IMPORTANT: WinSCP does NOT substitute %VAR% environment references
 ::     inside a script (.txt) file - a line like "open %WINSCP_SITE%" in the
 ::     script is sent to WinSCP literally and it will try to connect to a
-::     host actually named "%WINSCP_SITE%". Instead, the session is passed as
-::     a plain argument on the winscp.com command line in the runner .bat, so
-::     it is cmd.exe (not WinSCP) that expands %%PLACEHOLDER%% - and cmd.exe
-::     genuinely does expand it, at the moment the runner .bat runs. That
-::     keeps the actual secret value out of every generated file; it only
-::     ever exists as a resolved environment variable, briefly, in the
-::     winscp.com process's own command line. ---
+::     host actually named "%WINSCP_SITE%". The runner .bat instead builds a
+::     small temporary script at run time - an explicit "open <value>" line
+::     followed by this generated script's own contents - so it is cmd.exe
+::     (not WinSCP) that resolves %WINSCP_SITE% / %B2_KEY_ID% etc, at the
+::     moment the temp file is written. That keeps the actual secret out of
+::     every file this generator writes; it exists only as a resolved
+::     environment variable, briefly, inside that one temporary file, which
+::     the runner deletes after the run.
+::     This also means the runner does NOT pass /ini=nul to winscp.com:
+::     that switch tells WinSCP to ignore its whole configuration store
+::     (registry or ini file) - which is exactly where a saved site
+::     (WINSCP_SITE / Option A) lives, so /ini=nul would make a real saved
+::     site unresolvable no matter how its name reaches WinSCP. ---
 set "SESSION_ARG="
 if defined WINSCP_SITE (
     set "SESSION_ARG=%%WINSCP_SITE%%"
@@ -246,8 +255,13 @@ echo Writing %OUT_BAT% ...
     echo echo Uploading %COUNT% stale folder^(s^) to Backblaze B2, bucket "%%B2_BUCKET%%"...
     echo echo Log: %OUT_LOG%
     echo.
-    echo "%%WINSCP%%" "!SESSION_ARG!" /ini=nul /log="%OUT_LOG%" /script="%OUT_WINSCP%"
+    echo set "SESSTMP=%%TEMP%%\brc_b2_session_%%RANDOM%%.txt"
+    echo ^> "%%SESSTMP%%" echo open !SESSION_ARG!
+    echo type "%OUT_WINSCP%" ^>^> "%%SESSTMP%%"
+    echo.
+    echo "%%WINSCP%%" /log="%OUT_LOG%" /script="%%SESSTMP%%"
     echo set "RC=%%ERRORLEVEL%%"
+    echo del "%%SESSTMP%%" ^>nul 2^>nul
     echo.
     echo if "%%RC%%"=="0" ^(
     echo     echo Done. All transfers reported success. See the log for details:
